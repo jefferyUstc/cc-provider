@@ -62,9 +62,11 @@ Copy `providers/_template.env` to `providers/<command>.env`, fill it in, and rer
 - **Models**: every Claude alias and auto mode's classifier map to the provider's
   main or small model, and subagents run on the session's model. `/model` lists only
   those two (plus Default).
-- **`/model` + Enter** saves to the shared `~/.claude/settings.json`. When the session
-  ends, `ccx` restores the previous value if it is not a Claude model, so `claude`
-  keeps working. Press `s` instead to switch for the session only.
+- **`/model` + Enter** switches the session, but would also save the choice to the
+  shared `~/.claude/settings.json`. While a session runs, `ccx` undoes that within
+  half a second, so `claude` keeps your own default. Press `s` to skip the save.
+- **Resuming**: a session remembers its model. Resume one with the command that
+  started it (`stepfun --resume`), or pass a model: `claude --resume --model opus`.
 - **Credentials**: only the provider's key is sent. `ANTHROPIC_API_KEY` is emptied and
   inherited custom headers and cloud-provider switches are dropped. As with plain
   `claude`, commands the model runs can read your environment, including that key.

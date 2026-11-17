@@ -45,16 +45,29 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:$(cat "$t/port")/prefix
 EOF
 
 # Fake claude: records argv and env as JSON, then optionally edits settings.json
-# the way /model + Enter would, and hangs up ccx the way a closed terminal would.
+# the way /model would (FAKE_MODELS: comma-separated values saved one after the
+# other, "-" deletes the key as the Default row does), waiting after each for the
+# guard to act, and kills ccx the way a closed terminal (HUP) or `kill -9` would.
 cat > "$t/fake_claude" <<'EOF'
 #!/usr/bin/env python3
-import json, os, signal, sys
+import json, os, signal, sys, time
 json.dump({"argv": sys.argv[1:], "env": dict(os.environ)}, open(os.environ["FAKE_OUT"], "w"))
-if os.environ.get("FAKE_SET_MODEL"):
-    p = os.environ["CLAUDE_CONFIG_DIR"] + "/settings.json"
-    s = json.load(open(p)); s["model"] = os.environ["FAKE_SET_MODEL"]; json.dump(s, open(p, "w"))
-if os.environ.get("FAKE_HANGUP"):
-    os.kill(os.getppid(), signal.SIGHUP)
+p = os.environ["CLAUDE_CONFIG_DIR"] + "/settings.json"
+seen = []
+for m in filter(None, os.environ.get("FAKE_MODELS", "").split(",")):
+    s = json.load(open(p))
+    if m == "-":
+        s.pop("model", None)
+    else:
+        s["model"] = m
+    json.dump(s, open(p, "w"))
+    if os.environ.get("FAKE_KILL"):
+        break
+    time.sleep(1.2)
+    seen.append(json.load(open(p)).get("model"))
+json.dump(seen, open(os.environ["FAKE_OUT"] + ".seen", "w"))
+if os.environ.get("FAKE_KILL"):
+    os.kill(os.getppid(), getattr(signal, "SIG" + os.environ["FAKE_KILL"]))
 sys.exit(3)
 EOF
 chmod +x "$t/fake_claude"
@@ -109,20 +122,33 @@ fake -p x -- --settings literal
 check "arguments after -- are left alone" [ "$(q "d['argv'][2:]")" = "['-p', 'x', '--', '--settings', 'literal']" ]
 
 echo "== /model guard =="
+saved() { python3 -c "import json; print(json.dumps(json.load(open('$t/cfg/settings.json')), sort_keys=True))"; }   # key order is not kept
+seen() { cat "$t/fake.json.seen"; }
 echo '{"model": "opus", "theme": "dark"}' > "$t/cfg/settings.json"
-FAKE_SET_MODEL=big-model fake 2>/dev/null
-check "provider model ID written by /model is reverted" [ "$(python3 -c "import json; print(json.load(open('$t/cfg/settings.json')))")" = "{'model': 'opus', 'theme': 'dark'}" ]
-FAKE_SET_MODEL=sonnet fake
-check "a Claude alias written by /model is kept" [ "$(python3 -c "import json; print(json.load(open('$t/cfg/settings.json'))['model'])")" = sonnet ]
+FAKE_MODELS=big-model fake 2>"$t/guard.err"
+check "provider model saved by /model is undone while the session runs" [ "$(seen)" = '["opus"]' ]
+check "settings are otherwise untouched" [ "$(saved)" = "{\"model\": \"opus\", \"theme\": \"dark\"}" ]
+check "the user is told once the session ends" has "$t/guard.err" 'kept "model" in .*settings.json at "opus"'
+FAKE_MODELS=- fake 2>/dev/null
+check "Default row deleting the saved model is undone" [ "$(seen) $(saved)" = "[\"opus\"] {\"model\": \"opus\", \"theme\": \"dark\"}" ]
+FAKE_MODELS=sonnet,big-model fake 2>/dev/null
+check "a Claude model saved meanwhile is kept and becomes the value to keep" [ "$(seen)" = '["sonnet", "sonnet"]' ]
 echo '{"theme": "dark"}' > "$t/cfg/settings.json"
-FAKE_SET_MODEL=big-model fake 2>/dev/null
-check "model key removed again when it was unset" [ "$(python3 -c "import json; print(json.load(open('$t/cfg/settings.json')))")" = "{'theme': 'dark'}" ]
+FAKE_MODELS=big-model fake 2>/dev/null
+check "model key removed again when it was unset" [ "$(seen) $(saved)" = "[null] {\"theme\": \"dark\"}" ]
+echo '{"model": "big-model", "theme": "dark"}' > "$t/cfg/settings.json"
+fake 2>/dev/null
+check "provider model left by a killed session is cleared" [ "$(saved)" = "{\"theme\": \"dark\"}" ]
 echo '{"model": "opus"}' > "$t/cfg/settings.json"
-FAKE_SET_MODEL=big-model FAKE_HANGUP=1 fake 2>/dev/null
-check "reverted even when the terminal is closed (SIGHUP)" [ "$(python3 -c "import json; print(json.load(open('$t/cfg/settings.json'))['model'])")" = opus ]
+FAKE_MODELS=big-model FAKE_KILL=HUP fake 2>/dev/null
+check "undone when the terminal is closed (SIGHUP)" [ "$(saved)" = "{\"model\": \"opus\"}" ]
+FAKE_MODELS=big-model FAKE_KILL=KILL fake 2>/dev/null
+sleep 1.5
+check "undone even when ccx itself is killed (SIGKILL)" [ "$(saved)" = "{\"model\": \"opus\"}" ]
+check "no watcher is left behind" [ -z "$(pgrep -f "$t/cfg/settings.json" || true)" ]
 echo '{broken' > "$t/cfg/settings.json"; rm -f "$t/fake.json"
 fake 2>/dev/null
-check "malformed settings.json stops ccx before claude starts" [ ! -e "$t/fake.json" ]
+check "malformed settings.json is left alone and claude still starts" [ -e "$t/fake.json" -a "$(cat "$t/cfg/settings.json")" = '{broken' ]
 echo '{"model": "opus"}' > "$t/cfg/settings.json"
 
 echo "== errors =="

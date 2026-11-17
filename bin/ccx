@@ -204,40 +204,68 @@ PY
 )
 
 # Guard: in Claude Code, /model + Enter saves the choice to the shared user
-# settings. If this session saved a non-Claude model ID there, the plain
-# `claude` command would start on it next time, so put the old value back when
-# the session ends, including when the terminal is closed (EXIT trap).
-settings_file=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
-read_model() {
-  [ -f "$settings_file" ] || return 0
-  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model", ""))' "$settings_file"
-}
-is_claude_model() {
-  case $1 in ""|default|best|opusplan|opus*|sonnet*|haiku*|fable*|claude-*) return 0 ;; *) return 1 ;; esac
-}
-restore_model() {
-  local model_after
-  model_after=$(read_model)
-  if [ "$model_after" = "$model_before" ] || is_claude_model "$model_after"; then return 0; fi
-  python3 - "$settings_file" "$model_before" <<'PY' &&
-import json, os, sys
-path, old = os.path.realpath(sys.argv[1]), sys.argv[2]
-with open(path) as f:
-    settings = json.load(f)
-if old:
-    settings["model"] = old
-else:
-    del settings["model"]
-tmp = path + ".ccx-tmp"
-with open(tmp, "w") as f:
-    json.dump(settings, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-os.replace(tmp, path)
+# settings, and its Default row deletes the saved one. Either way the plain
+# `claude` command would lose your Claude default, and a provider's model ID there
+# makes it start on a model Anthropic does not have. So a watcher keeps "model" at
+# the last Claude value it saw (yours, or one a plain claude saves meanwhile) and
+# undoes anything else within half a second, for as long as this session runs.
+# It also clears a provider ID left behind by a session that was killed outright.
+python3 - "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" >/dev/null <<'PY' &
+import json, os, signal, sys, time
+
+path, ccx_pid = sys.argv[1], os.getppid()
+ALIASES = ("default", "best", "opusplan", "opus", "sonnet", "haiku", "fable")
+good, undone = None, None   # last Claude value seen; what was last undone
+
+
+def check():
+    global good, undone
+    real = os.path.realpath(path)
+    try:
+        with open(real) as f:
+            settings = json.load(f)
+    except (OSError, ValueError):   # missing, malformed or caught mid-write
+        return
+    if not isinstance(settings, dict):
+        return
+    now = settings.get("model")
+    if isinstance(now, str) and (now.startswith(ALIASES) or "claude" in now):
+        good = now
+    elif now != good:
+        if good is None:
+            del settings["model"]
+        else:
+            settings["model"] = good
+        tmp = real + ".ccx-tmp"
+        with open(tmp, "w") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        os.chmod(tmp, os.stat(real).st_mode & 0o777)
+        os.replace(tmp, real)
+        undone = json.dumps(now)   # null: the saved model was deleted
+
+
+def stop(*_):
+    raise SystemExit
+
+
+signal.signal(signal.SIGTERM, stop)          # sent by ccx when claude has exited
+signal.signal(signal.SIGHUP, signal.SIG_IGN)  # closed terminal: wait for ccx instead
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+try:
+    while os.getppid() == ccx_pid:           # ccx killed outright: finish up alone
+        check()
+        time.sleep(0.5)
+finally:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    check()
+    if undone is not None:
+        print(f'ccx: kept "model" in {path} at {json.dumps(good) if good else "<unset>"} '
+              f'(this session changed it to {undone}), so the plain claude command is unaffected',
+              file=sys.stderr)
 PY
-    echo "ccx: restored \"model\" in ${settings_file} from \"${model_after}\" to \"${model_before:-<unset>}\" so the plain claude command is unaffected" >&2
-}
-model_before=$(read_model)
-trap 'restore_model || true' EXIT   # never changes the exit status below
+watcher=$!
+trap 'kill "$watcher" 2>/dev/null || true; wait "$watcher" 2>/dev/null || true' EXIT   # exit status stays claude's
 
 unset CCX_KEY CCX_MODEL CCX_SMALL_MODEL CCX_LITELLM_PORT
 "$claude_bin" --settings "$settings_json" ${args[@]+"${args[@]}"}
