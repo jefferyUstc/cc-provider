@@ -1,0 +1,16 @@
+# Conda env for the LiteLLM proxy used by the `openai` provider.
+# Only needed for providers that go through LiteLLM; stepfun needs nothing here.
+#
+#   conda env create -f environment.yml     # first time
+#   conda env update -f environment.yml     # after changing a pin
+#
+# LiteLLM is pinned to an exact version released at least two weeks before it
+# was chosen (1.82.7 and 1.82.8 were compromised on PyPI). Bump it deliberately.
+name: ccx-litellm
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - litellm[proxy]==1.106.6

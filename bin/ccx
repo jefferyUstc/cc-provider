@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# ccx - launch Claude Code against a non-Anthropic model provider.
+#
+#   stepfun [claude args...]      # via a symlink named after the provider
+#   ccx <provider> [claude args...]
+#   ccx                           # this help plus the configured providers
+#
+# Each provider is providers/<name>.env; its API key comes from an exported
+# environment variable (e.g. STEPFUN_API_KEY). Everything happens in this process's
+# environment only, so the plain `claude` command keeps using your Anthropic
+# login untouched. Needs bash 3.2+ and python3; runs on macOS and Linux.
+set -euo pipefail
+
+# Resolve the real script location through symlinks.
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+  dir=$(cd -P "$(dirname "$src")" && pwd)
+  src=$(readlink "$src")
+  case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+CCX_HOME=$(cd -P "$(dirname "$src")/.." && pwd)
+PROVIDERS_DIR=$CCX_HOME/providers
+
+die() { echo "ccx: $*" >&2; exit 1; }
+
+list_providers() {
+  local f
+  for f in "$PROVIDERS_DIR"/*.env; do
+    case $(basename "$f") in _*) continue ;; esac
+    basename "$f" .env
+  done
+}
+
+# start_litellm KEY - for a provider without an Anthropic-compatible endpoint
+# (CCX_LITELLM_PORT set). A local LiteLLM proxy, run from the conda env in
+# environment.yml with providers/<name>.litellm.yaml, translates the protocol.
+# Only the proxy gets the real key. claude gets the proxy's master key, which is a
+# fingerprint of everything the proxy was started from (key, config, env pins): a
+# proxy left over from an older key, config or LiteLLM version rejects it and is
+# replaced, so it never serves stale settings.
+start_litellm() {
+  local key=$1 yaml=$PROVIDERS_DIR/$provider.litellm.yaml
+  local state=${XDG_STATE_HOME:-$HOME/.local/state}/ccx
+  local pidfile=$state/litellm-$provider.pid log=$state/litellm-$provider.log prefix pid n
+  [ -f "$yaml" ] || die "${conf} sets CCX_LITELLM_PORT but ${yaml} does not exist"
+
+  ANTHROPIC_BASE_URL=http://127.0.0.1:$CCX_LITELLM_PORT
+  ANTHROPIC_AUTH_TOKEN=sk-ccx-$(
+    { printf '%s\n' "$key"; cat "$yaml" "$CCX_HOME/environment.yml"; } |
+      python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:40])'
+  )
+  proxy_ok() { # the master key reaches curl on stdin, so it never shows up in `ps`
+    printf 'header = "Authorization: Bearer %s"\n' "$ANTHROPIC_AUTH_TOKEN" |
+      curl -fs -m 2 -o /dev/null -K - "$ANTHROPIC_BASE_URL/v1/models"
+  }
+  if proxy_ok; then return 0; fi
+
+  mkdir -p "$state"
+  if [ -f "$pidfile" ]; then
+    pid=$(cat "$pidfile")
+    if ps -p "$pid" -o command= | grep -q litellm; then
+      echo "ccx: replacing the LiteLLM proxy (key, ${yaml##*/} or environment.yml changed)" >&2
+      kill "$pid"
+      n=0
+      while kill -0 "$pid" 2>/dev/null; do
+        n=$((n + 1)); [ $n -le 50 ] || die "old LiteLLM proxy (pid ${pid}) did not exit"
+        sleep 0.2
+      done
+    fi
+    rm "$pidfile"
+  fi
+
+  command -v conda >/dev/null || die "conda not found on PATH (needed for the LiteLLM env)"
+  prefix=$(conda env list --json | python3 -c '
+import json, os, sys
+match = [p for p in json.load(sys.stdin)["envs"] if os.path.basename(p) == "ccx-litellm"]
+print(match[0] if match else "")')
+  [ -n "$prefix" ] || die "conda env 'ccx-litellm' not found: run 'conda env create -f ${CCX_HOME}/environment.yml'"
+
+  echo "ccx: starting LiteLLM proxy on 127.0.0.1:${CCX_LITELLM_PORT} (log: ${log})" >&2
+  ( umask 077             # the log can contain request details
+    export "$CCX_KEY=$key" LITELLM_MASTER_KEY="$ANTHROPIC_AUTH_TOKEN"
+    exec nohup "$prefix/bin/litellm" --config "$yaml" --host 127.0.0.1 --port "$CCX_LITELLM_PORT" \
+      >"$log" 2>&1 </dev/null ) &
+  pid=$!
+  echo "$pid" > "$pidfile"
+  for n in $(seq 1 120); do
+    if proxy_ok; then return 0; fi
+    kill -0 "$pid" 2>/dev/null || die "LiteLLM exited during startup (port ${CCX_LITELLM_PORT} busy?), see ${log}"
+    sleep 0.5
+  done
+  die "LiteLLM did not become ready within 60s, see ${log}"
+}
+
+provider=$(basename "$0")
+if [ "$provider" = ccx ]; then
+  case ${1:-} in
+    ""|-h|--help)
+      awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$src"
+      echo; echo "providers:"; list_providers | sed 's/^/  /'; exit 0 ;;
+  esac
+  provider=$1; shift
+fi
+
+conf=$PROVIDERS_DIR/$provider.env
+case $provider in _*|*/*) conf="" ;; esac    # neither the template nor a path
+[ -f "$conf" ] || die "unknown provider '${provider}' (available: $(list_providers | tr '\n' ' '))"
+
+# Drop anything inherited that could send credentials, extra headers or requests
+# somewhere else (the model variables are all set below).
+unset ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS ANTHROPIC_BETAS \
+      ANTHROPIC_SMALL_FAST_MODEL CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_CODE_OAUTH_TOKEN \
+      CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDE_CODE_USE_MANTLE \
+      CLAUDE_CODE_USE_ANTHROPIC_AWS CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD
+# Explicitly empty (not just unset) so no stored Anthropic key is sent to a third party.
+export ANTHROPIC_API_KEY=""
+
+CCX_KEY="" CCX_MODEL="" CCX_SMALL_MODEL="" CCX_LITELLM_PORT=""
+set -a                      # plain VAR=value lines in the .env file get exported
+# shellcheck source=/dev/null
+. "$conf"
+set +a
+[ -n "$CCX_MODEL" ] || die "${conf} does not set CCX_MODEL"
+: "${CCX_SMALL_MODEL:=$CCX_MODEL}"
+
+key=""
+if [ -n "$CCX_KEY" ]; then
+  key=${!CCX_KEY:-}
+  [ -n "$key" ] || die "environment variable ${CCX_KEY} is empty: export it in your shell rc file, then open a new terminal"
+  unset "$CCX_KEY"          # claude gets the credential as ANTHROPIC_AUTH_TOKEN only
+  ANTHROPIC_AUTH_TOKEN=$key
+fi
+if [ -n "$CCX_LITELLM_PORT" ]; then
+  [ -n "$key" ] || die "${conf} sets CCX_LITELLM_PORT but not CCX_KEY"
+  start_litellm "$key"
+fi
+[ -n "${ANTHROPIC_BASE_URL:-}" ] || die "${conf} does not set ANTHROPIC_BASE_URL"
+[ -n "${ANTHROPIC_AUTH_TOKEN:-}" ] || die "${conf} provides no credential (set CCX_KEY)"
+export ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN
+
+# Every model alias resolves to this provider's models and every subagent runs on
+# the session's model (an agent definition may pin a Claude model ID), so nothing
+# ever asks the provider for a Claude model ID.
+export ANTHROPIC_MODEL=$CCX_MODEL
+export ANTHROPIC_DEFAULT_OPUS_MODEL=$CCX_MODEL
+export ANTHROPIC_DEFAULT_SONNET_MODEL=$CCX_MODEL
+export ANTHROPIC_DEFAULT_FABLE_MODEL=$CCX_MODEL
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=$CCX_SMALL_MODEL
+export CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1
+export CLAUDE_CODE_AUTO_MODE_MODEL=$CCX_MODEL       # auto mode's permission classifier
+
+# Auto mode's server-side classifier checks are an Anthropic API feature that a
+# third-party endpoint can never provide. Without this, Claude Code shows a
+# "this session isn't eligible" notice and holds the first checked action until
+# you press Enter. Classifier requests then run on the provider's model, as before.
+# TODO: Anthropic documents CLAUDE_CODE_AUTO_MODE_SERVER as temporary
+# (https://code.claude.com/docs/en/auto-mode-classifier-billing). When a Claude
+# Code release drops it, the notice returns; replace this with whatever that
+# release documents.
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
+
+claude_bin=${CCX_CLAUDE_BIN:-$(command -v claude || true)}
+[ -n "$claude_bin" ] || die "claude not found on PATH"
+
+# Claude Code keeps only the last --settings it is given, so pull the caller's
+# --settings (from CCX_CLAUDE_ARGS or the command line) out of the arguments and
+# merge it with ours into a single flag. Arguments after `--` are left alone.
+# shellcheck disable=SC2206  # CCX_CLAUDE_ARGS is intentionally word-split
+all_args=(${CCX_CLAUDE_ARGS:-} "$@")
+args=()
+user_settings=""
+i=0
+while [ $i -lt ${#all_args[@]} ]; do
+  a=${all_args[$i]}
+  case $a in
+    --) args+=("${all_args[@]:$i}"); break ;;
+    --settings)
+      [ $((i + 1)) -lt ${#all_args[@]} ] || die "--settings needs a value"
+      user_settings=${all_args[$((i + 1))]}; i=$((i + 2)); continue ;;
+    --settings=*) user_settings=${a#--settings=} ;;
+    *) args+=("$a") ;;
+  esac
+  i=$((i + 1))
+done
+
+# /model picker: list only this provider's models instead of one identical row per
+# Claude tier. A modelPicker in the caller's own --settings takes precedence.
+settings_json=$(python3 - "$provider" "$CCX_MODEL" "$CCX_SMALL_MODEL" "$user_settings" <<'PY'
+import json, sys
+provider, model, small, user = sys.argv[1:]
+if not user:
+    settings = {}
+elif user.lstrip().startswith("{"):
+    settings = json.loads(user)
+else:
+    with open(user) as f:
+        settings = json.load(f)
+rows = [{"model": model, "label": model, "description": f"{provider} main model"}]
+if small != model:
+    rows.append({"model": small, "label": small, "description": f"{provider} small, fast model"})
+settings.setdefault("modelPicker", {"replaceBuiltInOptions": True, "options": rows})
+print(json.dumps(settings))
+PY
+)
+
+# Guard: in Claude Code, /model + Enter saves the choice to the shared user
+# settings. If this session saved a non-Claude model ID there, the plain
+# `claude` command would start on it next time, so put the old value back when
+# the session ends, including when the terminal is closed (EXIT trap).
+settings_file=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+read_model() {
+  [ -f "$settings_file" ] || return 0
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model", ""))' "$settings_file"
+}
+is_claude_model() {
+  case $1 in ""|default|best|opusplan|opus*|sonnet*|haiku*|fable*|claude-*) return 0 ;; *) return 1 ;; esac
+}
+restore_model() {
+  local model_after
+  model_after=$(read_model)
+  if [ "$model_after" = "$model_before" ] || is_claude_model "$model_after"; then return 0; fi
+  python3 - "$settings_file" "$model_before" <<'PY' &&
+import json, os, sys
+path, old = os.path.realpath(sys.argv[1]), sys.argv[2]
+with open(path) as f:
+    settings = json.load(f)
+if old:
+    settings["model"] = old
+else:
+    del settings["model"]
+tmp = path + ".ccx-tmp"
+with open(tmp, "w") as f:
+    json.dump(settings, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+os.replace(tmp, path)
+PY
+    echo "ccx: restored \"model\" in ${settings_file} from \"${model_after}\" to \"${model_before:-<unset>}\" so the plain claude command is unaffected" >&2
+}
+model_before=$(read_model)
+trap 'restore_model || true' EXIT   # never changes the exit status below
+
+unset CCX_KEY CCX_MODEL CCX_SMALL_MODEL CCX_LITELLM_PORT
+"$claude_bin" --settings "$settings_json" ${args[@]+"${args[@]}"}

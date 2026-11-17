@@ -1,0 +1,14 @@
+# LiteLLM proxy config for providers/openai.env: serves Anthropic's /v1/messages
+# and forwards every model name to OpenAI unchanged, so model IDs live only in
+# openai.env. ccx injects OPENAI_API_KEY and LITELLM_MASTER_KEY when it starts the proxy.
+model_list:
+  - model_name: "*"
+    litellm_params:
+      model: "openai/*"
+      api_key: os.environ/OPENAI_API_KEY
+
+litellm_settings:
+  drop_params: true   # drop Anthropic-only params OpenAI rejects instead of erroring
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
